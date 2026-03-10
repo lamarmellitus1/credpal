@@ -1,0 +1,84 @@
+
+# ── Named volumes ─────────────────────────────────────────────────────────────
+volumes:
+  postgres_data:
+  redis_data:
+
+# ── Shared health-check defaults ──────────────────────────────────────────────
+x-healthcheck-defaults: &healthcheck-defaults
+  interval: 30s
+  timeout: 10s
+  start_period: 15s
+  retries: 5
+
+services:
+
+  # ── Application ─────────────────────────────────────────────────────────────
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: release
+    image: node-devops-app:local
+    container_name: app
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      # PostgreSQL
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-appdb}
+      POSTGRES_USER: ${POSTGRES_USER:-appuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme_local}   # injected from .env / secret
+      # Redis
+      REDIS_HOST: cache
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-mellitus}
+    depends_on:
+      db:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
+    networks:
+      - backend
+
+  # ── PostgreSQL ───────────────────────────────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    container_name: postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-appdb}
+      POSTGRES_USER: ${POSTGRES_USER:-appuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme_local}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-appuser} -d ${POSTGRES_DB:-appdb}"]
+    networks:
+      - backend
+
+  # ── Redis ────────────────────────────────────────────────────────────────────
+  cache:
+    image: redis:7-alpine
+    container_name: redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-changeme}
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-changeme}", "ping"]
+    networks:
+      - backend
+
+networks:
+  backend:
+    driver: bridge

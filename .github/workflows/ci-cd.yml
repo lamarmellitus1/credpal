@@ -1,0 +1,194 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:  
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  DOCKERHUB_REPO: ${{ secrets.DOCKERHUB_USERNAME }}/node-devops-app
+
+
+jobs:
+
+  lint-and-test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+    steps: &steps-test
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run linter
+        run: npm run lint || true
+
+      - name: Run tests
+        run: npm test
+
+  build-and-push:
+    name: Build & Push to DockerHub
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    if: github.event_name == 'push'
+    outputs:
+      image_tag: ${{ steps.vars.outputs.image_tag }}
+    steps: &steps-build
+      - uses: actions/checkout@v4
+
+      - name: Set image tag
+        id: vars
+        run: echo "image_tag=sha-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to DockerHub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          target: release
+          push: true
+          tags: |
+            ${{ env.DOCKERHUB_REPO }}:${{ steps.vars.outputs.image_tag }}
+            ${{ env.DOCKERHUB_REPO }}:${{ github.ref_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  configure-aws-staging:
+    name: AWS OIDC (Staging)
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/develop'
+    steps: &steps-aws-staging
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_STAGING }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+  configure-aws-production:
+    name: AWS OIDC (Production)
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main'
+    steps: &steps-aws-production
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PRODUCTION }}
+          aws-region: ${{ secrets.AWS_REGION }}
+ 
+
+  deploy-staging:
+    name: Deploy → Staging
+    runs-on: ubuntu-latest
+    needs: [build-and-push, configure-aws-staging]
+    if: github.ref == 'refs/heads/develop'
+    environment:
+      name: staging
+      url: https://staging.example.com
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_STAGING }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Download task definition
+        run: |
+          aws ecs describe-task-definition --task-definition node-app-staging --query taskDefinition > task-definition.json
+          jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .placementConstraints, .compatibilities, .registeredAt, .registeredBy, .enableFaultInjection)' task-definition.json > updated-task-definition.json
+          mv updated-task-definition.json task-definition.json
+
+      - name: Fill in the new image ID in the Amazon ECS task definition
+        id: update-task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: node-app
+          image: ${{ env.DOCKERHUB_REPO }}:${{ needs.build-and-push.outputs.image_tag }}
+
+      - name: Deploy Amazon ECS task definition
+        id: deploy-task-def
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.update-task-def.outputs.task-definition }}
+          service: node-app-staging
+          cluster: staging-cluster
+          wait-for-service-stability: false
+
+      - name: Smoke test
+        run: curl -f https://staging.credpal.com/health || exit 1
+
+
+  deploy-production:
+    name: Deploy → Production
+    runs-on: ubuntu-latest
+    needs: [build-and-push, configure-aws-production]
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: https://app.credpal.com
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PRODUCTION }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Download task definition
+        run: |
+          aws ecs describe-task-definition --task-definition node-app-production --query taskDefinition > task-definition.json
+          jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .placementConstraints, .compatibilities, .registeredAt, .registeredBy, .enableFaultInjection)' task-definition.json > updated-task-definition.json
+          mv updated-task-definition.json task-definition.json
+
+      - name: Fill in the new image ID in the Amazon ECS task definition
+        id: update-task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: node-app
+          image: ${{ env.DOCKERHUB_REPO }}:${{ needs.build-and-push.outputs.image_tag }}
+
+      - name: Deploy Amazon ECS task definition
+        id: deploy-task-def
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.update-task-def.outputs.task-definition }}
+          service: node-app-production
+          cluster: production-cluster
+          wait-for-service-stability: false
+
+      - name: Smoke test
+        run: curl -f https://app.credpal.com/health || exit 1
