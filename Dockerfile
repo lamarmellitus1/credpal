@@ -1,6 +1,4 @@
-# ─────────────────────────────────────────────────────────────────────────────
 # Stage 1 – deps: install only production dependencies
-# ─────────────────────────────────────────────────────────────────────────────
 FROM node:20-alpine AS deps
 
 WORKDIR /app
@@ -11,9 +9,7 @@ COPY package*.json ./
 # Install production deps only
 RUN npm ci --omit=dev && npm cache clean --force
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Stage 2 – test: install all deps and run tests
-# ─────────────────────────────────────────────────────────────────────────────
 FROM node:20-alpine AS test
 
 WORKDIR /app
@@ -25,9 +21,7 @@ COPY app.js app.test.js ./
 
 RUN npm test
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Stage 3 – release: lean production image
-# ─────────────────────────────────────────────────────────────────────────────
 FROM node:20-alpine AS release
 
 # Security: upgrade OS packages
