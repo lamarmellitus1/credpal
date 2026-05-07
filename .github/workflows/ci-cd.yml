@@ -3,9 +3,7 @@ name: CI/CD Pipeline
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
-  workflow_dispatch:  
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -109,9 +107,6 @@ jobs:
     runs-on: ubuntu-latest
     needs: [build-and-push, configure-aws-production]
     if: github.ref == 'refs/heads/main'
-    environment:
-      name: Production
-      url: https://github.com/Lamarmellitus1/damolak-payment-gateway
     steps:
       - uses: actions/checkout@v4
 
